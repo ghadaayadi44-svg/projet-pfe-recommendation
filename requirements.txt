@@ -1,0 +1,9 @@
+flask==3.0.0
+sentence-transformers
+transformers
+torch
+pymongo
+numpy
+scikit-learn
+gunicorn
+python-dotenv
