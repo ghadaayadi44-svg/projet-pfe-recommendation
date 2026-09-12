@@ -1,0 +1,2 @@
+onnx_sbert/*.onnx filter=lfs diff=lfs merge=lfs -text
+onnx_sentiment/*.onnx filter=lfs diff=lfs merge=lfs -text

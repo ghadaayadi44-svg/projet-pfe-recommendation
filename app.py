@@ -4,13 +4,13 @@
 import os
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify
-from sentence_transformers import SentenceTransformer
-from transformers import pipeline
 from pymongo import MongoClient
 from bson import ObjectId
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 from collections import defaultdict
+
+from onnx_models import encode_texts, analyze_sentiment 
 
 
 # ============================================================
@@ -23,37 +23,22 @@ MONGO_URI = os.getenv('MONGO_URI')
 client = MongoClient(MONGO_URI)
 db = client['test']
 
-
-# ============================================================
-#  CHARGEMENT DES MODÈLES (une seule fois au démarrage)
-# ============================================================
-print("Chargement de SBERT (content-based)...")
-sbert_model = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
-print("✅ SBERT chargé")
-
-print("Chargement du modèle de sentiment BERT...")
-sentiment_analyzer = pipeline(
-    "sentiment-analysis",
-    model="nlptown/bert-base-multilingual-uncased-sentiment"
-)
-print("✅ Modèle de sentiment chargé")
+print("✅ Modèles ONNX chargés (voir onnx_models.py)")
 
 
 # ============================================================
-#  BRIQUE 1 : CONTENT-BASED (SBERT)
-#  Une seule fonction, utilisée par toutes les routes
+#  BRIQUE 1 : CONTENT-BASED (SBERT via ONNX)
 # ============================================================
 def score_content_based(description_etudiant, courses):
     """Calcule le score SBERT entre l'étudiant et chaque cours."""
     vecteurs_courses = np.array([c['embedding'] for c in courses])
-    vecteur_etudiant = sbert_model.encode([description_etudiant])[0]
+    vecteur_etudiant = encode_texts([description_etudiant])[0]
     scores = cosine_similarity([vecteur_etudiant], vecteurs_courses)[0]
     return {c['_id']: float(scores[i]) for i, c in enumerate(courses)}, vecteur_etudiant
 
 
 # ============================================================
-#  BRIQUE 2 : FEEDBACK (note + sentiment + popularité)
-#  Une seule fonction, utilisée par toutes les routes
+#  BRIQUE 2 : FEEDBACK (note + sentiment + popularité) — inchangé
 # ============================================================
 def score_feedback(course_ids):
     """Agrège note, sentiment et popularité par cours depuis MongoDB."""
@@ -83,8 +68,7 @@ def score_feedback(course_ids):
 
 
 # ============================================================
-#  BRIQUE 3 : COLLABORATIF (étudiants similaires)
-#  Une seule fonction, utilisée uniquement par l'hybride
+#  BRIQUE 3 : COLLABORATIF (étudiants similaires, via ONNX)
 # ============================================================
 def mode(liste):
     return max(set(liste), key=liste.count) if liste else None
@@ -122,9 +106,7 @@ def score_collaboratif(vecteur_etudiant, language, level, user_id=None):
     score_cf_dict = defaultdict(float)
     voisins = []
     if voisins_potentiels:
-        vecteurs_voisins = sbert_model.encode(
-            [p['description_profil'] for p in voisins_potentiels], show_progress_bar=False
-        )
+        vecteurs_voisins = encode_texts([p['description_profil'] for p in voisins_potentiels])
         sims = cosine_similarity([vecteur_etudiant], vecteurs_voisins)[0]
         for p, sim in zip(voisins_potentiels, sims):
             p['similarite'] = float(sim)
@@ -145,15 +127,9 @@ def score_collaboratif(vecteur_etudiant, language, level, user_id=None):
 
 
 # ============================================================
-#  BRIQUE 4 : ASSEMBLAGE FINAL
-#  Combine les briques ci-dessus selon les poids demandés — pas de recalcul
+#  BRIQUE 4 : ASSEMBLAGE FINAL — inchangé
 # ============================================================
 def assembler_scores(courses, scores_bert, feedback_stats, score_cf_dict=None):
-    """
-    Combine content-based + feedback (+ collaboratif si fourni) en un score final.
-    Si score_cf_dict est None → pas de collaboratif (route /recommander).
-    Si score_cf_dict est fourni → collaboratif inclus (route /recommander-hybride).
-    """
     max_cf = max(score_cf_dict.values()) if score_cf_dict else 0
 
     for c in courses:
@@ -165,7 +141,6 @@ def assembler_scores(courses, scores_bert, feedback_stats, score_cf_dict=None):
         c['nb_avis'] = fb['nb_avis']
 
         if score_cf_dict is not None:
-            # --- avec collaboratif ---
             brut = score_cf_dict.get(cid)
             score_cf = (brut / max_cf) if brut and max_cf > 0 else 0.5
             c['score_cf'] = round(score_cf, 3)
@@ -177,7 +152,6 @@ def assembler_scores(courses, scores_bert, feedback_stats, score_cf_dict=None):
               + 0.10 * fb['popularite_norm'], 4
             )
         else:
-            # --- sans collaboratif : poids redistribués sur content-based ---
             c['score_final'] = round(
                 0.55 * scores_bert[cid]
               + 0.15 * fb['note_norm']
@@ -193,37 +167,29 @@ def assembler_scores(courses, scores_bert, feedback_stats, score_cf_dict=None):
 
 
 # ============================================================
-#  ROUTE 1 : ENCODER UNE FORMATION (à la création d'un cours)
+#  ROUTE 1 : ENCODER UNE FORMATION (via ONNX)
 # ============================================================
 @app.route('/encoder-formation', methods=['POST'])
 def encoder_formation():
     data = request.get_json()
     description = data.get('description', '')
-    embedding = sbert_model.encode([description])[0].tolist()
+    embedding = encode_texts([description])[0].tolist()
     return jsonify({'success': True, 'embedding': embedding})
 
 
 # ============================================================
-#  ROUTE 2 : ANALYSER LE SENTIMENT (à la création d'un feedback)
+#  ROUTE 2 : ANALYSER LE SENTIMENT (via ONNX)
 # ============================================================
 @app.route('/analyser-sentiment', methods=['POST'])
 def analyser_sentiment_route():
     data = request.get_json()
     comment = data.get('comment', '')
-
-    if not comment.strip():
-        return jsonify({'success': True, 'sentiment_score': 0})
-
-    resultat = sentiment_analyzer(comment[:512])[0]
-    etoiles = int(resultat['label'][0])
-    score = 1 if etoiles >= 4 else (0 if etoiles == 3 else -1)
-
+    score = analyze_sentiment(comment)
     return jsonify({'success': True, 'sentiment_score': score})
 
 
 # ============================================================
-#  ROUTE 3 : RECOMMANDER — content-based + feedback (SANS collaboratif)
-#  Appelle score_content_based() + score_feedback() + assembler_scores()
+#  ROUTE 3 : RECOMMANDER — inchangée dans sa logique
 # ============================================================
 @app.route('/recommander', methods=['POST'])
 def recommander():
@@ -244,8 +210,7 @@ def recommander():
 
 
 # ============================================================
-#  ROUTE 4 : RECOMMANDER HYBRIDE — content-based + collaboratif + feedback
-#  Appelle les 3 MÊMES fonctions + score_collaboratif() en plus
+#  ROUTE 4 : RECOMMANDER HYBRIDE — inchangée dans sa logique
 # ============================================================
 @app.route('/recommander-hybride', methods=['POST'])
 def recommander_hybride():
@@ -277,7 +242,7 @@ def debug_cf():
     description_etudiant = data['description']
     user_id = data.get('user_id')
 
-    vecteur_etudiant = sbert_model.encode([description_etudiant])[0]
+    vecteur_etudiant = encode_texts([description_etudiant])[0]
     score_cf_dict, voisins = score_collaboratif(vecteur_etudiant, language, level, user_id)
 
     if not voisins:
@@ -301,4 +266,4 @@ def debug_cf():
 #  LANCEMENT DU SERVEUR
 # ============================================================
 if __name__ == '__main__':
-    app.run(port=5001, debug=True)
+    app.run(host='0.0.0.0', port=int(os.getenv('PORT', 5001)))
