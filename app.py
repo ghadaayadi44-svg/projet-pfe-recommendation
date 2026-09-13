@@ -12,7 +12,7 @@ import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 from collections import defaultdict
 
-from onnx_models import encode_texts, analyze_sentiment  # <-- remplace SentenceTransformer + pipeline
+from onnx_models import encode_texts  # <-- remplace SentenceTransformer (SBERT uniquement, plus de sentiment ici)
 
 
 # ============================================================
@@ -189,14 +189,11 @@ def encoder_formation():
 
 
 # ============================================================
-#  ROUTE 2 : ANALYSER LE SENTIMENT (via ONNX)
+#  ROUTE 2 : ANALYSER LE SENTIMENT
+#  ⚠️ Deplacee vers le service dedie lingia-sentiment (voir
+#     sentiment-service/app.py) pour eviter de charger SBERT et le
+#     modele de sentiment dans le meme processus (risque OOM).
 # ============================================================
-@app.route('/analyser-sentiment', methods=['POST'])
-def analyser_sentiment_route():
-    data = request.get_json()
-    comment = data.get('comment', '')
-    score = analyze_sentiment(comment)
-    return jsonify({'success': True, 'sentiment_score': score})
 
 
 # ============================================================
