@@ -1,5 +1,7 @@
 # ============================================================
 #  IMPORTS
+#  ⚠️ torch, sentence-transformers et transformers.pipeline supprimés.
+#     Tout le reste (Mongo, Flask, logique métier) est identique à l'original.
 # ============================================================
 import os
 from dotenv import load_dotenv
@@ -10,7 +12,7 @@ import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 from collections import defaultdict
 
-from onnx_models import encode_texts, analyze_sentiment 
+from onnx_models import encode_texts, analyze_sentiment  # <-- remplace SentenceTransformer + pipeline
 
 
 # ============================================================
@@ -24,6 +26,15 @@ client = MongoClient(MONGO_URI)
 db = client['test']
 
 print("✅ Modèles ONNX chargés (voir onnx_models.py)")
+
+
+# ============================================================
+#  ROUTE HEALTH CHECK — pour UptimeRobot / monitoring
+#  Ne charge aucun modèle, répond toujours 200 rapidement.
+# ============================================================
+@app.route('/health', methods=['GET'])
+def health():
+    return jsonify({'status': 'ok'}), 200
 
 
 # ============================================================
