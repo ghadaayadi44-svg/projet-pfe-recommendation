@@ -11,6 +11,7 @@ from bson import ObjectId
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 from collections import defaultdict
+import random
 
 from onnx_models import encode_texts  # <-- remplace SentenceTransformer (SBERT uniquement, plus de sentiment ici)
 
@@ -85,7 +86,7 @@ def mode(liste):
     return max(set(liste), key=liste.count) if liste else None
 
 
-def score_collaboratif(vecteur_etudiant, language, level, user_id=None):
+def score_collaboratif(vecteur_etudiant, language, level, user_id=None, max_voisins_potentiels=30):
     """Calcule le score CF pour chaque cours à partir des voisins (Enrollment payés)."""
     pipeline_profils = [
         {'$match': {'status': 'paid'}},
@@ -108,11 +109,15 @@ def score_collaboratif(vecteur_etudiant, language, level, user_id=None):
         'user_id': p['_id'],
         'language': mode(p['languages']),
         'level': mode(p['levels']),
-        'description_profil': ' | '.join(p['descriptions']),
+        'description_profil': ' | '.join(p['descriptions'])[:1000],
         'courses_suivis': p['courses_suivis']
     } for p in profils_bruts]
 
     voisins_potentiels = [p for p in profils if p['language'] == language and p['level'] == level]
+
+    # ⚠️ Limite le nombre de textes envoyés à l'encodage batch pour éviter le pic RAM
+    if len(voisins_potentiels) > max_voisins_potentiels:
+        voisins_potentiels = random.sample(voisins_potentiels, max_voisins_potentiels)
 
     score_cf_dict = defaultdict(float)
     voisins = []
@@ -135,7 +140,6 @@ def score_collaboratif(vecteur_etudiant, language, level, user_id=None):
                 score_cf_dict.pop(cid, None)
 
     return score_cf_dict, voisins
-
 
 # ============================================================
 #  BRIQUE 4 : ASSEMBLAGE FINAL — inchangé
