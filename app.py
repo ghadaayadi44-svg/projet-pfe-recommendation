@@ -50,17 +50,24 @@ def score_content_based(description_etudiant, courses):
 
 
 # ============================================================
-#  BRIQUE 2 : FEEDBACK (note + sentiment + popularité) — inchangé
+#  BRIQUE 2 : FEEDBACK (note + sentiment + popularité + avis positifs)
 # ============================================================
 def score_feedback(course_ids):
-    """Agrège note, sentiment et popularité par cours depuis MongoDB."""
+    """Agrège note, sentiment, popularité et nb d'avis positifs par cours."""
     pipeline_feedback = [
         {'$match': {'course': {'$in': course_ids}}},
         {'$group': {
             '_id': '$course',
             'note_moyenne': {'$avg': '$rating'},
             'sentiment_moyen': {'$avg': '$sentiment_score'},
-            'nb_avis': {'$sum': 1}
+            'nb_avis': {'$sum': 1},
+            # avis positif = note >= 4 OU sentiment > 0.2
+            'nb_positifs': {'$sum': {'$cond': [
+                {'$or': [
+                    {'$gte': ['$rating', 4]},
+                    {'$gt': ['$sentiment_score', 0.2]}
+                ]}, 1, 0
+            ]}}
         }}
     ]
     stats = {s['_id']: s for s in db['feedbacks'].aggregate(pipeline_feedback)}
@@ -72,9 +79,11 @@ def score_feedback(course_ids):
         s = stats.get(cid, {})
         resultat[cid] = {
             'note_norm': s.get('note_moyenne', 2.5) / 5.0,
+            'note_moyenne': round(s.get('note_moyenne', 0), 1),
             'sentiment_norm': (s.get('sentiment_moyen', 0) + 1) / 2.0,
-            'popularite_norm': np.log1p(s.get('nb_avis', 0)) / max_log_avis if max_log_avis > 0 else 0,
-            'nb_avis': s.get('nb_avis', 0)
+            'popularite_norm': float(np.log1p(s.get('nb_avis', 0)) / max_log_avis) if max_log_avis > 0 else 0,
+            'nb_avis': s.get('nb_avis', 0),
+            'nb_positifs': s.get('nb_positifs', 0)
         }
     return resultat
 
@@ -87,7 +96,8 @@ def mode(liste):
 
 
 def score_collaboratif(vecteur_etudiant, language, level, user_id=None, max_voisins_potentiels=30):
-    """Calcule le score CF pour chaque cours à partir des voisins (Enrollment payés)."""
+    """Calcule le score CF pour chaque cours à partir des voisins (Enrollment payés).
+    Retourne aussi le nombre de voisins ayant suivi chaque cours."""
     pipeline_profils = [
         {'$match': {'status': 'paid'}},
         {'$lookup': {
@@ -120,6 +130,7 @@ def score_collaboratif(vecteur_etudiant, language, level, user_id=None, max_vois
         voisins_potentiels = random.sample(voisins_potentiels, max_voisins_potentiels)
 
     score_cf_dict = defaultdict(float)
+    nb_voisins_par_cours = defaultdict(int)   # NOUVEAU
     voisins = []
     if voisins_potentiels:
         vecteurs_voisins = encode_texts([p['description_profil'] for p in voisins_potentiels])
@@ -132,19 +143,86 @@ def score_collaboratif(vecteur_etudiant, language, level, user_id=None, max_vois
         for voisin in voisins:
             for cid in voisin['courses_suivis']:
                 score_cf_dict[cid] += voisin['similarite']
+                nb_voisins_par_cours[cid] += 1   # NOUVEAU
 
         if user_id:
             deja_suivi = next((p['courses_suivis'] for p in profils
                                 if str(p['user_id']) == user_id), [])
             for cid in deja_suivi:
                 score_cf_dict.pop(cid, None)
+                nb_voisins_par_cours.pop(cid, None)   # NOUVEAU
 
-    return score_cf_dict, voisins
+    return score_cf_dict, voisins, nb_voisins_par_cours
+
 
 # ============================================================
-#  BRIQUE 4 : ASSEMBLAGE FINAL — inchangé
+#  BRIQUE 4 : EXPLICATION (pourquoi cette recommandation ?)
 # ============================================================
-def assembler_scores(courses, scores_bert, feedback_stats, score_cf_dict=None):
+def generer_explication(fb, score_bert, score_cf, nb_voisins, poids):
+    raisons = []
+
+    # 1. Similarity between student description and course
+    pct_sim = round(max(score_bert, 0) * 100)
+    raisons.append({
+        'type': 'similarite',
+        'icone': '🎯',
+        'texte': f"Its description matches your profile at {pct_sim}%"
+    })
+
+    # 2. Positive reviews
+    if fb['nb_avis'] > 0:
+        raisons.append({
+            'type': 'feedback',
+            'icone': '⭐',
+            'texte': f"{fb['nb_positifs']} positive review(s) out of {fb['nb_avis']} "
+                     f"(average rating {fb['note_moyenne']}/5)"
+        })
+        if fb['sentiment_norm'] >= 0.6:
+            raisons.append({
+                'type': 'sentiment',
+                'icone': '💬',
+                'texte': f"Student comments are positive "
+                         f"({round(fb['sentiment_norm'] * 100)}% positive sentiment)"
+            })
+    else:
+        raisons.append({
+            'type': 'feedback',
+            'icone': '🆕',
+            'texte': "New course: no reviews yet"
+        })
+
+    # 3. Similar students (hybrid only)
+    if nb_voisins and nb_voisins > 0:
+        raisons.append({
+            'type': 'collaboratif',
+            'icone': '👥',
+            'texte': f"{nb_voisins} student(s) with a profile similar to yours took this course"
+        })
+
+    return {
+        'raisons': raisons,
+        'details': {
+            'similarite_pct': pct_sim,
+            'nb_avis': fb['nb_avis'],
+            'nb_avis_positifs': fb['nb_positifs'],
+            'note_moyenne': fb['note_moyenne'],
+            'sentiment_pct': round(fb['sentiment_norm'] * 100),
+            'nb_etudiants_similaires': nb_voisins or 0,
+            'contributions': {
+                'similarite': round(poids['bert'] * score_bert * 100, 1),
+                'collaboratif': round(poids['cf'] * (score_cf or 0) * 100, 1),
+                'note': round(poids['note'] * fb['note_norm'] * 100, 1),
+                'sentiment': round(poids['sent'] * fb['sentiment_norm'] * 100, 1),
+                'popularite': round(poids['pop'] * fb['popularite_norm'] * 100, 1),
+            }
+        }
+    }
+
+
+# ============================================================
+#  BRIQUE 5 : ASSEMBLAGE FINAL (+ explication)
+# ============================================================
+def assembler_scores(courses, scores_bert, feedback_stats, score_cf_dict=None, nb_voisins_par_cours=None):
     max_cf = max(score_cf_dict.values()) if score_cf_dict else 0
 
     for c in courses:
@@ -159,6 +237,7 @@ def assembler_scores(courses, scores_bert, feedback_stats, score_cf_dict=None):
             brut = score_cf_dict.get(cid)
             score_cf = (brut / max_cf) if brut and max_cf > 0 else 0.5
             c['score_cf'] = round(score_cf, 3)
+            poids = {'bert': 0.45, 'cf': 0.25, 'note': 0.10, 'sent': 0.10, 'pop': 0.10}
             c['score_final'] = round(
                 0.45 * scores_bert[cid]
               + 0.25 * score_cf
@@ -166,13 +245,19 @@ def assembler_scores(courses, scores_bert, feedback_stats, score_cf_dict=None):
               + 0.10 * fb['sentiment_norm']
               + 0.10 * fb['popularite_norm'], 4
             )
+            nb_voisins = (nb_voisins_par_cours or {}).get(cid, 0)
+            c['explication'] = generer_explication(
+                fb, scores_bert[cid], score_cf, nb_voisins, poids)
         else:
+            poids = {'bert': 0.55, 'cf': 0, 'note': 0.15, 'sent': 0.15, 'pop': 0.15}
             c['score_final'] = round(
                 0.55 * scores_bert[cid]
               + 0.15 * fb['note_norm']
               + 0.15 * fb['sentiment_norm']
               + 0.15 * fb['popularite_norm'], 4
             )
+            c['explication'] = generer_explication(
+                fb, scores_bert[cid], None, 0, poids)
 
         c['_id'] = str(c['_id'])
         c['teacher'] = str(c.get('teacher', ''))
@@ -201,7 +286,7 @@ def encoder_formation():
 
 
 # ============================================================
-#  ROUTE 3 : RECOMMANDER — inchangée dans sa logique
+#  ROUTE 3 : RECOMMANDER (content-based + feedback)
 # ============================================================
 @app.route('/recommander', methods=['POST'])
 def recommander():
@@ -222,7 +307,7 @@ def recommander():
 
 
 # ============================================================
-#  ROUTE 4 : RECOMMANDER HYBRIDE — inchangée dans sa logique
+#  ROUTE 4 : RECOMMANDER HYBRIDE (avec explication)
 # ============================================================
 @app.route('/recommander-hybride', methods=['POST'])
 def recommander_hybride():
@@ -238,9 +323,12 @@ def recommander_hybride():
 
     scores_bert, vecteur_etudiant = score_content_based(description_etudiant, courses)
     feedback_stats = score_feedback([c['_id'] for c in courses])
-    score_cf_dict, _ = score_collaboratif(vecteur_etudiant, language, level, user_id)
+    score_cf_dict, _, nb_voisins_par_cours = score_collaboratif(
+        vecteur_etudiant, language, level, user_id)
 
-    top = assembler_scores(courses, scores_bert, feedback_stats, score_cf_dict=score_cf_dict)
+    top = assembler_scores(courses, scores_bert, feedback_stats,
+                           score_cf_dict=score_cf_dict,
+                           nb_voisins_par_cours=nb_voisins_par_cours)
     return jsonify({'success': True, 'recommendations': top})
 
 
@@ -255,7 +343,7 @@ def debug_cf():
     user_id = data.get('user_id')
 
     vecteur_etudiant = encode_texts([description_etudiant])[0]
-    score_cf_dict, voisins = score_collaboratif(vecteur_etudiant, language, level, user_id)
+    score_cf_dict, voisins, _ = score_collaboratif(vecteur_etudiant, language, level, user_id)
 
     if not voisins:
         return jsonify({'success': True, 'message': 'Aucun voisin trouvé', 'voisins': []})
